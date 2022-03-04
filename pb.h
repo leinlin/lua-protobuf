@@ -73,6 +73,7 @@ typedef signed   long long  int64_t;
 
 #include <stddef.h>
 #include <limits.h>
+#include <lauxlib.h>
 
 PB_NS_BEGIN
 
@@ -157,6 +158,24 @@ PB_API int pb_typebyname  (const char *name, int def);
 PB_API int pb_wtypebyname (const char *name, int def);
 PB_API int pb_wtypebytype (int type);
 
+#if LUA_VERSION_NUM >= 503
+# define lua53_getfield lua_getfield
+# define lua53_rawgeti  lua_rawgeti
+# define lua53_rawgetp  lua_rawgetp
+#else /* not Lua 5.3 */
+static int lua53_getfield(lua_State* L, int idx, const char* field)
+{
+    lua_getfield(L, idx, field); return lua_type(L, -1);
+}
+static int lua53_rawgeti(lua_State* L, int idx, lua_Integer i)
+{
+    lua_rawgeti(L, idx, i); return lua_type(L, -1);
+}
+static int lua53_rawgetp(lua_State* L, int idx, const void* p)
+{
+    lua_rawgetp(L, idx, p); return lua_type(L, -1);
+}
+#endif
 
 /* encode */
 
@@ -195,7 +214,6 @@ PB_API size_t pb_addfixed64  (pb_Buffer *b, uint64_t v);
 PB_API size_t pb_addslice  (pb_Buffer *b, pb_Slice s);
 PB_API size_t pb_addbytes  (pb_Buffer *b, pb_Slice s);
 PB_API size_t pb_addlength (pb_Buffer *b, size_t len);
-
 
 /* type info database state and name table */
 
@@ -237,7 +255,6 @@ PB_API const pb_Name *pb_oneofname (const pb_Type *t, int oneof_index);
 
 PB_API int pb_nexttype  (const pb_State *S, const pb_Type **ptype);
 PB_API int pb_nextfield (const pb_Type *t, const pb_Field **pfield);
-
 
 /* util: memory pool */
 
@@ -317,6 +334,7 @@ struct pb_State {
     pb_Table     types;
     pb_Pool      typepool;
     pb_Pool      fieldpool;
+    lua_State* L;
 };
 
 struct pb_Field {
@@ -345,6 +363,30 @@ struct pb_Type {
     unsigned is_dead   : 1;
 };
 
+typedef struct lpb_State {
+    const pb_State* state;
+    pb_State  local;
+    pb_Cache  cache;
+    pb_Buffer buffer;
+    int defs_index;
+    int repeateds_index;
+    int oneof_index;
+    int enum_index;
+    int enc_hooks_index;
+    int dec_hooks_index;
+    unsigned use_hooks : 1; /* lpb_Int64Mode */
+    unsigned enum_as_value : 1;
+    unsigned default_mode : 2; /* lpb_DefMode */
+    unsigned int64_mode : 2; /* lpb_Int64Mode */
+	unsigned message_as_meta : 1;
+} lpb_State;
+
+typedef struct lpb_Env {
+    lua_State* L;
+    lpb_State* LS;
+    pb_Buffer* b;
+    pb_Slice* s;
+} lpb_Env;
 
 PB_NS_END
 
@@ -368,6 +410,7 @@ PB_NS_BEGIN
 
 
 /* conversions */
+PB_API void lpb_pushdefaults(lua_State* L, lpb_State* LS, const pb_Type* t);
 
 PB_API uint32_t pb_encode_sint32(int32_t value)
 { return ((uint32_t)value << 1) ^ -(value < 0); }
@@ -396,6 +439,50 @@ PB_API uint64_t pb_encode_double(double value)
 PB_API double pb_decode_double(uint64_t value)
 { union { uint64_t u64; double d; } u; u.u64 = value; return u.d; }
 
+static void lpb_pushtypetable(lua_State* L, lpb_State* LS, const pb_Type* t);
+
+static int lpb_reftable(lua_State* L, int ref) {
+    if (ref != LUA_NOREF) {
+        lua_rawgeti(L, LUA_REGISTRYINDEX, ref);
+        return ref;
+    }
+    else {
+        lua_newtable(L);
+        lua_pushvalue(L, -1);
+        return luaL_ref(L, LUA_REGISTRYINDEX);
+    }
+}
+
+/* metatable */
+static void lpb_pushdeftable(lua_State* L, lpb_State* LS)
+{
+    LS->defs_index = lpb_reftable(L, LS->defs_index);
+}
+
+static void lpb_pushrepeatedtable(lua_State* L, lpb_State* LS)
+{
+    LS->repeateds_index = lpb_reftable(L, LS->repeateds_index);
+}
+
+static void lpb_pushenumtable(lua_State* L, lpb_State* LS)
+{
+    LS->enum_index = lpb_reftable(L, LS->enum_index);
+}
+
+static void lpb_pushoneoftable(lua_State* L, lpb_State* LS)
+{
+    LS->oneof_index = lpb_reftable(L, LS->oneof_index);
+}
+
+static void lpb_pushenchooktable(lua_State* L, lpb_State* LS)
+{
+    LS->enc_hooks_index = lpb_reftable(L, LS->enc_hooks_index);
+}
+
+static void lpb_pushdechooktable(lua_State* L, lpb_State* LS)
+{
+    LS->dec_hooks_index = lpb_reftable(L, LS->dec_hooks_index);
+}
 
 /* decode */
 
@@ -1605,6 +1692,43 @@ static int pbL_prefixname(pb_State *S, pb_Slice s, size_t *ps, pb_Loader *L, pb_
     return PB_OK;
 }
 
+static int enum_index_event(lua_State* L) {
+    int t = lua_type(L, 1);
+    if (t == LUA_TTABLE) {
+        const char* key = lua_tostring(L, 2);
+        lua_rawget(L, -2);
+        if (lua_isnil(L, -1)) {
+            return luaL_error(L, "enum key %s doesn't exist", key);
+        }
+        else {
+            return 1;
+        }
+    }
+    else {
+        return luaL_error(L, "enum is not a lua table");
+    }
+    lua_pushnil(L);
+    return 1;
+}
+
+static void pbL_setenumindex(lua_State* L, pb_State* S, pbL_EnumInfo* info)
+{
+    lpb_pushenumtable(L, S);
+    if (lua53_rawgetp(L, -1, info) != LUA_TTABLE) {
+        lua_pop(L, 1);
+        lua_newtable(L);                //stack name table
+        lua_pushstring(L, "__index");
+        lua_pushcfunction(L, enum_index_event);
+
+        lua_rawset(L, -3);
+        lua_pushvalue(L, -1);
+        lua_rawsetp(L, -3, info);
+    }
+
+    lua_remove(L, -2);
+    lua_setmetatable(L, -2);
+}
+
 static int pbL_loadEnum(pb_State *S, pbL_EnumInfo *info, pb_Loader *L) {
     size_t i, count, curr;
     pb_Name *name;
@@ -1612,10 +1736,19 @@ static int pbL_loadEnum(pb_State *S, pbL_EnumInfo *info, pb_Loader *L) {
     pbC(pbL_prefixname(S, info->name, &curr, L, &name));
     pbCM(t = pb_newtype(S, name));
     t->is_enum = 1;
+
+    lua_newtable(S->L);
+    pbL_setenumindex(S->L, S, info);
     for (i = 0, count = pbL_count(info->value); i < count; ++i) {
-        pbL_EnumValueInfo *ev = &info->value[i];
+        pbL_EnumValueInfo* ev = &info->value[i];
         pbCE(pb_newfield(S, t, pb_newname(S, ev->name, NULL), ev->number));
+
+        lua_pushlstring(S->L, ev->name.p, pb_len(ev->name));
+        lua_pushnumber(S->L, ev->number);
+        lua_rawset(S->L, -3);
     }
+    lua_setglobal(S->L, t->basename);
+
     L->b.size = (unsigned)curr;
     return PB_OK;
 }

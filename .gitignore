@@ -6,11 +6,3 @@
 *.gcov
 *.gcda
 *.gcno
-*.pb
-*.dSYM
-*.out
-test*.lua
-lua*/
-test*
-*.natvis
-out*
